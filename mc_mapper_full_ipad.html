@@ -1,0 +1,145 @@
+
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Minecraft Mapper フル版</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css"/>
+<style>
+  html, body { margin:0; height:100%; }
+  #map { width: 100%; height: 100%; }
+  #panel {
+    position: absolute; top:10px; right:10px; z-index:1000; background:white; padding:10px; 
+    max-width: 300px; border:1px solid #ccc; border-radius:6px; font-family: sans-serif; font-size:12px;
+  }
+  input { width: 100%; margin-bottom:4px; }
+  button { width: 100%; margin-top:4px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+  <b>原点・スケール設定</b><br/>
+  原点緯度(lat): <input id="originLat" type="number" step="0.000001" value="35.6268"><br/>
+  原点経度(lon): <input id="originLon" type="number" step="0.000001" value="139.8856"><br/>
+  原点ブロックX: <input id="originX" type="number" step="1" value="0"><br/>
+  原点ブロックZ: <input id="originZ" type="number" step="1" value="0"><br/>
+  スケール(m/ブロック): <input id="scale" type="number" step="0.01" value="1"><br/>
+  回転(°): <input id="rotation" type="number" step="0.1" value="0"><br/>
+  <button id="pick-origin">地図をクリックして原点に設定</button><br/>
+  <button id="export-json">JSON出力</button>
+  <button id="export-csv">CSV出力</button>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+<script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+
+<script>
+// --- 地図レイヤー ---
+var osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom:20, attribution:'© OpenStreetMap'});
+var esri = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {maxZoom:20, attribution:'© Esri'});
+
+var map = L.map('map', {center:[35.6268,139.8856], zoom:16, layers:[osm]});
+L.control.layers({"地図(OSM)":osm, "航空写真(Esri)":esri}).addTo(map);
+
+// --- 描画機能 ---
+var drawnItems = new L.FeatureGroup();
+map.addLayer(drawnItems);
+
+var drawControl = new L.Control.Draw({
+  edit:{featureGroup:drawnItems},
+  draw:{polygon:true, polyline:true, marker:true, rectangle:true, circle:false, circlemarker:false}
+});
+map.addControl(drawControl);
+
+map.on(L.Draw.Event.CREATED, function(e){drawnItems.addLayer(e.layer);});
+map.on(L.Draw.Event.EDITED, function(){/*更新可*/});
+map.on(L.Draw.Event.DELETED, function(){/*更新可*/});
+
+// --- 原点クリック設定 ---
+var pickingOrigin=false;
+document.getElementById('pick-origin').addEventListener('click',()=>{pickingOrigin=!pickingOrigin;});
+map.on('click', function(e){
+  if(!pickingOrigin) return;
+  document.getElementById('originLat').value = e.latlng.lat.toFixed(6);
+  document.getElementById('originLon').value = e.latlng.lng.toFixed(6);
+  pickingOrigin=false;
+});
+
+// --- 緯度経度 → メートル ---
+function latLonToMeters(lat, lon, lat0, lon0){
+  const phi = lat0*Math.PI/180;
+  const mPerDegLat = 111132.954 - 559.822*Math.cos(2*phi) + 1.175*Math.cos(4*phi);
+  const mPerDegLon = (Math.PI/180)*6378137*Math.cos(phi);
+  const dx = (lon-lon0)*mPerDegLon;
+  const dy = (lat-lat0)*mPerDegLat;
+  return [dx, dy];
+}
+
+// --- メートル → マイクラ座標 ---
+function metersToMinecraft(dx, dy, scale, rotDeg, ox, oz){
+  const th = rotDeg*Math.PI/180;
+  const x = ox + (dx*Math.cos(th)+dy*Math.sin(th))/scale;
+  const z = oz + (-dx*Math.sin(th)+dy*Math.cos(th))/scale;
+  return [x.toFixed(2), z.toFixed(2)];
+}
+
+// --- Feature → Minecraft座標 ---
+function transformFeature(f){
+  const scale=parseFloat(document.getElementById('scale').value);
+  const rot=parseFloat(document.getElementById('rotation').value);
+  const lat0=parseFloat(document.getElementById('originLat').value);
+  const lon0=parseFloat(document.getElementById('originLon').value);
+  const ox=parseFloat(document.getElementById('originX').value);
+  const oz=parseFloat(document.getElementById('originZ').value);
+
+  function tr(coord){return metersToMinecraft(...latLonToMeters(coord[1],coord[0],lat0,lon0),scale,rot,ox,oz);}
+
+  const g=f.geometry;
+  if(!g) return null;
+  if(g.type==='Point') return {type:'Point', coordinates:tr(g.coordinates)};
+  if(g.type==='LineString') return {type:'LineString', coordinates:g.coordinates.map(tr)};
+  if(g.type==='Polygon') return {type:'Polygon', coordinates:g.coordinates.map(r=>r.map(tr))};
+  if(g.type==='MultiLineString') return {type:'MultiLineString', coordinates:g.coordinates.map(line=>line.map(tr))};
+  if(g.type==='MultiPolygon') return {type:'MultiPolygon', coordinates:g.coordinates.map(p=>p.map(r=>r.map(tr)))};
+  if(g.type==='MultiPoint') return {type:'MultiPoint', coordinates:g.coordinates.map(tr)};
+  return null;
+}
+
+// --- 現在の図形を収集 ---
+function collectFeatures(){
+  const features=[];
+  drawnItems.eachLayer(layer=>{features.push(layer.toGeoJSON());});
+  return {type:'FeatureCollection', features};
+}
+
+// --- JSON / CSV エクスポート ---
+function download(url, filename){const a=document.createElement('a');a.href=url;a.download=filename;document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url);}
+
+document.getElementById('export-json').addEventListener('click',()=>{
+  const fc=collectFeatures();
+  const out={type:'FeatureCollection', features:fc.features.map(f=>({type:'Feature', properties:f.properties||{}, geometry:transformFeature(f)}))};
+  download(URL.createObjectURL(new Blob([JSON.stringify(out,null,2)],{type:'application/json'})),'minecraft_blocks.json');
+});
+
+document.getElementById('export-csv').addEventListener('click',()=>{
+  const fc=collectFeatures();
+  let rows=["feature_id,part,vertex_index,x_block,z_block,type"];
+  fc.features.forEach((f,idx)=>{
+    const g=transformFeature(f);
+    if(!g) return;
+    if(g.type==='Point'){rows.push([idx,0,0,g.coordinates[0],g.coordinates[1],"Point"].join(","));}
+    else if(g.type==='LineString'){g.coordinates.forEach((c,i)=>rows.push([idx,0,i,c[0],c[1],"LineString"].join(",")));}
+    else if(g.type==='Polygon'){g.coordinates.forEach((ring,r)=>ring.forEach((c,i)=>rows.push([idx,r,i,c[0],c[1],"Polygon"].join(","))))}
+    else if(g.type==='MultiLineString'){g.coordinates.forEach((line,p)=>line.forEach((c,i)=>rows.push([idx,p,i,c[0],c[1],"MultiLineString"].join(","))))}
+    else if(g.type==='MultiPolygon'){g.coordinates.forEach((poly,p)=>poly.forEach((ring,r)=>ring.forEach((c,i)=>rows.push([idx,`${p}-${r}`,i,c[0],c[1],"MultiPolygon"].join(",")))))}
+    else if(g.type==='MultiPoint'){g.coordinates.forEach((c,i)=>rows.push([idx,0,i,c[0],c[1],"MultiPoint"].join(",")))}
+  });
+  download(URL.createObjectURL(new Blob([rows.join("\n")],{type:'text/csv'})),'minecraft_blocks.csv');
+});
+</script>
+</body>
+</html>
